@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CMS Question Upload Checker</title>
+
+  <!-- Libraries via CDN — no install needed -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0F1117; color: #E2E8F0; font-family: 'Segoe UI', system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #1E2230; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+  const { useState, useCallback, useRef } = React;
+  const { createRoot } = ReactDOM;
+
+  const COLORS = {
+    qFormat:   { bg: "#FFF3CD", border: "#F0A500", label: "Q# Format",      dot: "#F0A500" },
+    loMapping: { bg: "#FFE2CC", border: "#E8620A", label: "LO ID Mapping",   dot: "#E8620A" },
+    eolDupe:   { bg: "#E9D5FF", border: "#7C3AED", label: "EOL Duplicate",   dot: "#7C3AED" },
+    pairing:   { bg: "#DBEAFE", border: "#2563EB", label: "Evaluatives",     dot: "#2563EB" },
+    options:   { bg: "#FEE2E2", border: "#DC2626", label: "Missing Options", dot: "#DC2626" },
+    answer:    { bg: "#FCE7F3", border: "#DB2777", label: "Missing Answer",  dot: "#DB2777" },
+  };
+
+  const COLUMNS = [
+    "Question No","Question","Option A","Option B","Option C","Option D",
+    "Answer","Image","Node id","LO Description","EOL Description",
+    "Evaluatives","Difficulty Level","Language","Category"
+  ];
+
+  const COL_WIDTHS = {
+    "Question No":90,"Question":260,"Option A":100,"Option B":100,
+    "Option C":100,"Option D":100,"Answer":100,"Image":100,
+    "Node id":90,"LO Description":180,"EOL Description":200,
+    "Evaluatives":90,"Difficulty Level":100,"Language":80,"Category":80
+  };
+
+  function runChecks(rows) {
+    const errors = rows.map(() => ({}));
+    const summary = { qFormat:0, loMapping:0, eolDupe:0, pairing:0, options:0, answer:0 };
+
+    // 1. Question Number Format
+    const qnumRe = /^\d+\.\d+$/;
+    rows.forEach((r, i) => {
+      const v = String(r["Question No"] ?? "").trim();
+      if (!qnumRe.test(v)) { errors[i]["Question No"] = "qFormat"; summary.qFormat++; }
+    });
+
+    // 2. LO ID → 1 LO Description
+    const loMap = {};
+    rows.forEach((r) => {
+      const id = String(r["Node id"] ?? "").trim();
+      const lo = String(r["LO Description"] ?? "").trim();
+      if (!id) return;
+      if (!loMap[id]) loMap[id] = new Set();
+      if (lo) loMap[id].add(lo);
+    });
+    rows.forEach((r, i) => {
+      const id = String(r["Node id"] ?? "").trim();
+      if (id && loMap[id] && loMap[id].size > 1) {
+        errors[i]["Node id"] = "loMapping";
+        errors[i]["LO Description"] = "loMapping";
+        summary.loMapping++;
+      }
+    });
+
+    // 3. EOL Description must not cross to a different LO ID
+    const eolMap = {};
+    rows.forEach((r) => {
+      const eol = String(r["EOL Description"] ?? "").trim();
+      const id  = String(r["Node id"] ?? "").trim();
+      if (!eol || !id) return;
+      if (!eolMap[eol]) eolMap[eol] = new Set();
+      eolMap[eol].add(id);
+    });
+    rows.forEach((r, i) => {
+      const eol = String(r["EOL Description"] ?? "").trim();
+      if (eol && eolMap[eol] && eolMap[eol].size > 1) {
+        errors[i]["EOL Description"] = "eolDupe";
+        errors[i]["Node id"] = errors[i]["Node id"] || "eolDupe";
+        summary.eolDupe++;
+      }
+    });
+
+    // 4. Evaluatives must be 0 or 1
+    rows.forEach((r, i) => {
+      const ev = r["Evaluatives"];
+      const missing = ev === "" || ev == null;
+      const invalid = !missing && String(ev).trim() !== "0" && String(ev).trim() !== "1";
+      if (missing || invalid) { errors[i]["Evaluatives"] = "pairing"; summary.pairing++; }
+    });
+
+    // 5. Options & Answer
+    rows.forEach((r, i) => {
+      const optA = String(r["Option A"] ?? "").trim();
+      const ans  = String(r["Answer"]   ?? "").trim();
+      if (!optA) { errors[i]["Option A"] = "options"; summary.options++; }
+      if (!ans)  { errors[i]["Answer"]   = "answer";  summary.answer++;  }
+    });
+
+    return { errors, summary };
+  }
+
+  function App() {
+    const [rows, setRows]         = useState(null);
+    const [errors, setErrors]     = useState(null);
+    const [summary, setSummary]   = useState(null);
+    const [fileName, setFileName] = useState("");
+    const [dragging, setDragging] = useState(false);
+    const [activeFilters, setActiveFilters] = useState(new Set());
+    const [parseError, setParseError] = useState("");
+    const fileRef = useRef();
+
+    async function parseDocxToRows(arrayBuffer) {
+      const result = await mammoth.convertToHtml({ arrayBuffer });
+      const doc = new DOMParser().parseFromString(result.value, "text/html");
+      const table = doc.querySelector("table");
+      if (!table) throw new Error("No table found in Word document.");
+      const allRows = Array.from(table.querySelectorAll("tr"));
+      if (allRows.length < 2) throw new Error("Table has no data rows.");
+      const headers = Array.from(allRows[0].querySelectorAll("th,td")).map(td => td.textContent.trim());
+      return allRows.slice(1).map(tr => {
+        const cells = Array.from(tr.querySelectorAll("td,th"));
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = cells[i]?.textContent.trim() ?? ""; });
+        return obj;
+      });
+    }
+
+    async function processFile(file) {
+      if (!file) return;
+      setParseError("");
+      setFileName(file.name);
+      const ext = file.name.split(".").pop().toLowerCase();
+      try {
+        let data;
+        const ab = await file.arrayBuffer();
+        if (ext === "docx" || ext === "doc") {
+          data = await parseDocxToRows(ab);
+        } else {
+          const wb = XLSX.read(ab, { type: "array" });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          data = XLSX.utils.sheet_to_json(ws, { defval: "" });
+        }
+        const { errors: errs, summary: sum } = runChecks(data);
+        setRows(data); setErrors(errs); setSummary(sum); setActiveFilters(new Set());
+      } catch(err) {
+        setParseError(err.message || "Failed to parse file.");
+      }
+    }
+
+    const onDrop = useCallback((e) => {
+      e.preventDefault(); setDragging(false);
+      processFile(e.dataTransfer.files[0]);
+    }, []);
+
+    const toggleFilter = (key) => {
+      setActiveFilters(prev => {
+        const next = new Set(prev);
+        next.has(key) ? next.delete(key) : next.add(key);
+        return next;
+      });
+    };
+
+    const totalErrors = summary ? Object.values(summary).reduce((a,b)=>a+b,0) : 0;
+
+    const filteredRows = rows
+      ? rows.map((r,i)=>({row:r,idx:i})).filter(({idx}) => {
+          if (activeFilters.size === 0) return true;
+          return [...activeFilters].some(f => Object.values(errors[idx]).includes(f));
+        })
+      : [];
+
+    const getCellStyle = (rowIdx, col) => {
+      const t = errors?.[rowIdx]?.[col];
+      if (!t) return {};
+      return { background: COLORS[t].bg, borderLeft: `3px solid ${COLORS[t].border}` };
+    };
+
+    const s = {
+      wrap: { padding:28, minHeight:"100vh" },
+      card: { background:"#1E2230", borderRadius:10, border:"1px solid #2D3748" },
+    };
+
+    return React.createElement("div", { style: s.wrap },
+
+      /* ── Header ── */
+      React.createElement("div", { style:{marginBottom:24, display:"flex", alignItems:"center", gap:12} },
+        React.createElement("div", { style:{
+          width:36, height:36, borderRadius:8,
+          background:"linear-gradient(135deg,#6366F1,#8B5CF6)",
+          display:"flex", alignItems:"center", justifyContent:"center", fontSize:18
+        }}, "🔍"),
+        React.createElement("div", null,
+          React.createElement("h1", { style:{fontSize:22, fontWeight:700, letterSpacing:"-0.3px"} },
+            "CMS Question Upload Checker"),
+          React.createElement("p", { style:{fontSize:12, color:"#94A3B8", marginTop:2} },
+            "Supports Excel (.xlsx/.xls), CSV, and Word (.docx/.doc) — validates all 5 checklist rules")
+        )
+      ),
+
+      /* ── Parse error ── */
+      parseError && React.createElement("div", { style:{
+        background:"#450A0A", border:"1px solid #DC2626", borderRadius:10,
+        padding:"12px 16px", marginBottom:16, color:"#FCA5A5", fontSize:13,
+        display:"flex", gap:10, alignItems:"flex-start"
+      }},
+        React.createElement("span", { style:{fontSize:18} }, "⚠️"),
+        React.createElement("div", null,
+          React.createElement("strong", null, "Could not parse file: "), parseError,
+          React.createElement("div", { style:{fontSize:11, color:"#F87171", marginTop:3} },
+            "Ensure the file has a header row matching the expected column names and is not password-protected.")
+        )
+      ),
+
+      /* ── Upload Zone (when no file loaded) ── */
+      !rows && React.createElement("div", {
+        onDrop, onDragOver:(e)=>{e.preventDefault();setDragging(true);},
+        onDragLeave:()=>setDragging(false),
+        onClick:()=>fileRef.current.click(),
+        style:{
+          border:`2px dashed ${dragging?"#6366F1":"#334155"}`,
+          borderRadius:16, padding:"60px 40px", textAlign:"center", cursor:"pointer",
+          background: dragging?"rgba(99,102,241,0.07)":"rgba(255,255,255,0.02)",
+          marginBottom:24, transition:"all 0.2s"
+        }
+      },
+        React.createElement("div",{style:{fontSize:40, marginBottom:12}},"📂"),
+        React.createElement("p",{style:{fontWeight:600,fontSize:15,marginBottom:8}},"Drop your file here or click to browse"),
+        React.createElement("div",{style:{display:"flex",gap:8,justifyContent:"center",marginBottom:6}},
+          [".xlsx",".xls",".csv",".docx",".doc"].map(fmt =>
+            React.createElement("span",{key:fmt,style:{
+              background:"#1E2230",border:"1px solid #334155",borderRadius:4,
+              padding:"2px 7px",fontSize:11,color:"#94A3B8",fontFamily:"monospace"
+            }},fmt)
+          )
+        ),
+        React.createElement("p",{style:{fontSize:11,color:"#475569"}},"Excel, CSV, or Word document"),
+        React.createElement("input",{
+          ref:fileRef, type:"file", accept:".xlsx,.xls,.csv,.doc,.docx",
+          style:{display:"none"}, onChange:(e)=>processFile(e.target.files[0])
+        })
+      ),
+
+      /* ── Pre-upload rule list ── */
+      !rows && React.createElement("div",{style:{...s.card, padding:"16px 20px"}},
+        React.createElement("div",{style:{fontSize:11,fontWeight:700,color:"#94A3B8",marginBottom:12,textTransform:"uppercase",letterSpacing:"0.5px"}},"5 Validation Checks"),
+        [
+          ["🔢","qFormat",  "Question Number Format",  "Must match 1.1, 1.2 … 1.10 pattern"],
+          ["🔗","loMapping","LO ID Mapping",            "1 Node id → 1 LO Description only"],
+          ["♊","eolDupe",  "Duplicate EOL Mapping",    "Same EOL Description must not cross to a different LO ID (multiple EOLs per LO ID is allowed)"],
+          ["⚖️","pairing",  "Evaluatives Flag",         "Must be 0 (non-evaluative) or 1 (evaluative)"],
+          ["✏️","options",  "Options Availability",     "Option A must be present"],
+          ["✅","answer",   "Answer Availability",      "Answer must be mapped for every question"],
+        ].map(([icon,key,name,desc]) =>
+          React.createElement("div",{key, style:{display:"flex",alignItems:"center",gap:12,padding:"8px 0",borderBottom:"1px solid #1A2030"}},
+            React.createElement("span",{style:{fontSize:16}},icon),
+            React.createElement("div",{style:{width:12,height:12,borderRadius:3,flexShrink:0,background:COLORS[key].bg,border:`2px solid ${COLORS[key].border}`}}),
+            React.createElement("div",null,
+              React.createElement("div",{style:{fontSize:12,fontWeight:600,color:"#CBD5E1"}},name),
+              React.createElement("div",{style:{fontSize:11,color:"#64748B"}},desc)
+            )
+          )
+        )
+      ),
+
+      /* ── Post-upload view ── */
+      rows && React.createElement(React.Fragment, null,
+
+        /* File bar */
+        React.createElement("div",{style:{...s.card,padding:"10px 16px",marginBottom:18,display:"flex",alignItems:"center",justifyContent:"space-between"}},
+          React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10}},
+            React.createElement("span",{style:{fontSize:18}},"📄"),
+            React.createElement("div",null,
+              React.createElement("div",{style:{fontWeight:600,fontSize:13}},fileName),
+              React.createElement("div",{style:{fontSize:11,color:"#64748B"}},rows.length+" rows loaded")
+            )
+          ),
+          React.createElement("div",{style:{display:"flex",gap:8}},
+            React.createElement("div",{style:{
+              background:totalErrors===0?"#065F46":"#7F1D1D",
+              color:totalErrors===0?"#6EE7B7":"#FCA5A5",
+              borderRadius:6,padding:"4px 12px",fontSize:12,fontWeight:700
+            }}, totalErrors===0?"✅ No Errors":`⚠️ ${totalErrors} Issues`),
+            React.createElement("button",{
+              onClick:()=>{setRows(null);setErrors(null);setSummary(null);setFileName("");},
+              style:{background:"#2D3748",border:"none",color:"#94A3B8",borderRadius:6,padding:"4px 12px",fontSize:12,cursor:"pointer"}
+            },"Re-upload")
+          )
+        ),
+
+        /* Summary Cards */
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:8,marginBottom:18}},
+          Object.entries(COLORS).map(([key,c]) => {
+            const count = summary[key]||0;
+            const active = activeFilters.has(key);
+            return React.createElement("div",{key,
+              onClick:()=>count>0&&toggleFilter(key),
+              style:{
+                background:active?c.bg:"#1E2230",
+                border:`1px solid ${active?c.border:count>0?"#2D3748":"#1E2230"}`,
+                borderRadius:10,padding:"10px 12px",cursor:count>0?"pointer":"default",
+                transition:"all 0.15s",opacity:count===0?0.4:1
+              }},
+              React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:6}},
+                React.createElement("div",{style:{width:8,height:8,borderRadius:"50%",background:c.dot,flexShrink:0}}),
+                React.createElement("span",{style:{fontSize:10,color:active?"#1E2230":"#64748B",fontWeight:600}},c.label)
+              ),
+              React.createElement("div",{style:{fontSize:22,fontWeight:700,color:active?"#1E2230":count>0?c.dot:"#334155"}},count),
+              active && React.createElement("div",{style:{fontSize:9,color:"#374151",marginTop:2}},"click to clear")
+            );
+          })
+        ),
+
+        /* Legend */
+        React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:8,marginBottom:14,alignItems:"center"}},
+          React.createElement("span",{style:{fontSize:11,color:"#64748B",marginRight:4}},"Legend:"),
+          Object.entries(COLORS).map(([key,c])=>
+            React.createElement("div",{key,style:{display:"flex",alignItems:"center",gap:5}},
+              React.createElement("div",{style:{width:14,height:14,borderRadius:3,background:c.bg,border:`2px solid ${c.border}`}}),
+              React.createElement("span",{style:{fontSize:10,color:"#94A3B8"}},c.label)
+            )
+          )
+        ),
+
+        /* Filter indicator */
+        activeFilters.size>0 && React.createElement("div",{style:{
+          background:"#1E2A3A",border:"1px solid #2563EB",borderRadius:8,
+          padding:"8px 14px",marginBottom:12,fontSize:12,color:"#93C5FD",
+          display:"flex",alignItems:"center",justifyContent:"space-between"
+        }},
+          React.createElement("span",null,`Showing ${filteredRows.length} rows with: `+[...activeFilters].map(f=>COLORS[f].label).join(", ")),
+          React.createElement("button",{
+            onClick:()=>setActiveFilters(new Set()),
+            style:{background:"none",border:"none",color:"#3B82F6",cursor:"pointer",fontSize:11}
+          },"Clear filters ✕")
+        ),
+
+        /* Table */
+        React.createElement("div",{style:{overflowX:"auto",borderRadius:10,border:"1px solid #2D3748",maxHeight:"calc(100vh - 380px)"}},
+          React.createElement("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:11,tableLayout:"fixed"}},
+            React.createElement("colgroup",null,
+              React.createElement("col",{style:{width:36}}),
+              COLUMNS.map(col=>React.createElement("col",{key:col,style:{width:COL_WIDTHS[col]||100}}))
+            ),
+            React.createElement("thead",{style:{position:"sticky",top:0,zIndex:2}},
+              React.createElement("tr",null,
+                React.createElement("th",{style:{background:"#0F1117",color:"#64748B",padding:"8px 10px",textAlign:"center",borderBottom:"1px solid #2D3748",fontSize:10,fontWeight:600}},"#"),
+                COLUMNS.map(col=>React.createElement("th",{key:col,style:{background:"#0F1117",color:"#94A3B8",padding:"8px 10px",textAlign:"left",borderBottom:"1px solid #2D3748",fontWeight:600,fontSize:10,textTransform:"uppercase",whiteSpace:"nowrap"}},col))
+              )
+            ),
+            React.createElement("tbody",null,
+              filteredRows.length===0
+                ? React.createElement("tr",null,
+                    React.createElement("td",{colSpan:COLUMNS.length+1,style:{textAlign:"center",padding:"40px",color:"#475569",fontSize:13}},
+                      totalErrors===0?"✅ All rows passed validation!":"No rows match the selected filter."
+                    )
+                  )
+                : filteredRows.map(({row,idx})=>
+                    React.createElement("tr",{key:idx,style:{background:Object.keys(errors[idx]).length>0?"rgba(239,68,68,0.03)":"transparent",borderBottom:"1px solid #1A2030"}},
+                      React.createElement("td",{style:{padding:"6px 10px",textAlign:"center",color:"#475569",fontSize:10}},idx+1),
+                      COLUMNS.map(col=>{
+                        const cs = getCellStyle(idx,col);
+                        const hasErr = !!errors[idx][col];
+                        const val = String(row[col]??"");
+                        const disp = val.length>60?val.slice(0,57)+"…":val;
+                        return React.createElement("td",{key:col,title:val,style:{
+                          padding:"6px 10px",color:hasErr?"#1A1A2E":"#CBD5E1",
+                          maxWidth:COL_WIDTHS[col]||100,overflow:"hidden",
+                          textOverflow:"ellipsis",whiteSpace:"nowrap",position:"relative",...cs
+                        }},
+                          hasErr && React.createElement("span",{style:{
+                            position:"absolute",top:2,right:3,width:5,height:5,
+                            borderRadius:"50%",background:COLORS[errors[idx][col]].dot
+                          }}),
+                          disp || React.createElement("span",{style:{color:hasErr?"#7F1D1D":"#334155",fontStyle:"italic"}},"empty")
+                        );
+                      })
+                    )
+                  )
+            )
+          )
+        ),
+
+        /* Rules footer */
+        React.createElement("div",{style:{...s.card,marginTop:20,padding:"14px 18px"}},
+          React.createElement("div",{style:{fontSize:11,fontWeight:700,color:"#94A3B8",marginBottom:10,textTransform:"uppercase",letterSpacing:"0.5px"}},"Validation Rules Applied"),
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px 20px"}},
+            [
+              ["qFormat",  "Q# format must match pattern like 1.1, 1.2 … 1.10"],
+              ["loMapping","1 LO ID (Node id) → exactly 1 LO Description"],
+              ["eolDupe",  "EOL Description found in one LO ID must not appear in another LO ID"],
+              ["pairing",  "Evaluatives must be 0 (non-evaluative) or 1 (evaluative)"],
+              ["options",  "Option A must be present for every question"],
+              ["answer",   "Answer must be present for every question"],
+            ].map(([key,desc])=>
+              React.createElement("div",{key,style:{display:"flex",alignItems:"flex-start",gap:8}},
+                React.createElement("div",{style:{width:10,height:10,borderRadius:2,flexShrink:0,marginTop:2,background:COLORS[key].bg,border:`1.5px solid ${COLORS[key].border}`}}),
+                React.createElement("span",{style:{fontSize:11,color:"#64748B",lineHeight:1.4}},desc)
+              )
+            )
+          )
+        )
+      )
+    );
+  }
+
+  createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
